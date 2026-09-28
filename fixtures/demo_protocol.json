@@ -1,0 +1,67 @@
+{
+  "protocol_id": "demo-delivery-v1",
+  "version": 1,
+  "title": "室内递送基础重复校准",
+  "task_family": "indoor-delivery",
+  "seed": 20260921,
+  "bootstrap_samples": 500,
+  "strata": [
+    {
+      "key": "clear-aisle",
+      "label": "通道无遮挡",
+      "required_trials": 3
+    },
+    {
+      "key": "cross-traffic",
+      "label": "存在横向人流",
+      "required_trials": 3
+    }
+  ],
+  "metrics": [
+    {
+      "key": "completed",
+      "label": "是否完成",
+      "kind": "binary",
+      "unit": null,
+      "direction": "higher"
+    },
+    {
+      "key": "completion_seconds",
+      "label": "完成用时",
+      "kind": "continuous",
+      "unit": "s",
+      "direction": "lower"
+    },
+    {
+      "key": "interventions",
+      "label": "人工干预次数",
+      "kind": "count",
+      "unit": "count",
+      "direction": "lower"
+    }
+  ],
+  "stratum_weights": {
+    "clear-aisle": "0.4",
+    "cross-traffic": "0.6"
+  },
+  "admission_rules": [
+    {
+      "metric": "completed",
+      "statistic": "wilson_lower",
+      "operator": "gte",
+      "threshold": "0.29"
+    },
+    {
+      "metric": "completion_seconds",
+      "statistic": "weighted_mean",
+      "operator": "lte",
+      "threshold": "65"
+    },
+    {
+      "metric": "interventions",
+      "statistic": "weighted_mean",
+      "operator": "lte",
+      "threshold": "1.2"
+    }
+  ]
+}
