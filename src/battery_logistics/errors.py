@@ -26,6 +26,11 @@ class InvalidState(SupplyError):
     status = 409
 
 
+class ServiceUnavailable(SupplyError):
+    code = "service_unavailable"
+    status = 503
+
+
 class ValidationFailed(SupplyError):
     code = "validation_failed"
     status = 422

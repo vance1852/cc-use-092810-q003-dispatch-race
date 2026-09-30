@@ -141,6 +141,8 @@ CREATE TABLE IF NOT EXISTS transfers (
     inventory_lot_id TEXT NOT NULL REFERENCES inventory_lots(lot_id),
     loaded_energy_kwh TEXT NOT NULL,
     expected_delivered_energy_kwh TEXT NOT NULL,
+    expected_arrival TEXT,
+    request_sha256 TEXT,
     departed_at TEXT NOT NULL,
     arrived_at TEXT,
     state TEXT NOT NULL DEFAULT 'in_transit' CHECK(state IN ('in_transit','delivered','disputed')),
@@ -198,7 +200,8 @@ ON supply_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    # ThreadingHTTPServer 会在不同线程复用同一连接；写操作由 BEGIN IMMEDIATE 串行化。
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
@@ -209,6 +212,11 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    # 旧版本库可能缺少发车事实的追溯列，SQLite 用 ADD COLUMN 平滑升级。
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(transfers)")}
+    for column in ("expected_arrival", "request_sha256"):
+        if column not in columns:
+            connection.execute(f"ALTER TABLE transfers ADD COLUMN {column} TEXT")
 
 
 @contextmanager
