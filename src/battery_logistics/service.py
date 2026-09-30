@@ -404,6 +404,31 @@ class SupplyService:
             self._audit("route", route_id, "allocation.completed", actor_id, {"allocation_id": allocation_id})
         return {"allocation_id": allocation_id, **result}
 
+    def _replay_dispatch(self, transfer_id: str, request_digest: str) -> dict[str, Any] | None:
+        """按发车编号找回已裁决结果；编号复用于不同内容时稳定冲突。"""
+        stored = self.connection.execute(
+            "SELECT request_sha256,response_json FROM supply_idempotency "
+            "WHERE scope='transfer' AND idempotency_key=?",
+            (transfer_id,),
+        ).fetchone()
+        if stored is None:
+            return None
+        if stored["request_sha256"] != request_digest:
+            raise Conflict("发车编号对应不同的确认内容")
+        return json.loads(stored["response_json"])
+
+    @staticmethod
+    def _transfer_view(transfer: sqlite3.Row, transit_hours: int) -> dict[str, Any]:
+        return {
+            "transfer_id": transfer["transfer_id"],
+            "state": transfer["state"],
+            "loaded_energy_kwh": transfer["loaded_energy_kwh"],
+            "expected_delivered_energy_kwh": transfer["expected_delivered_energy_kwh"],
+            "expected_arrival": utc_text(
+                parse_utc(transfer["departed_at"]) + timedelta(hours=transit_hours)
+            ),
+        }
+
     def dispatch_transfer(
         self,
         actor_id: str,
@@ -413,57 +438,117 @@ class SupplyService:
         expected_revision: int,
     ) -> dict[str, Any]:
         self._require(actor_id, "transfer.write")
-        nomination = self.connection.execute(
-            "SELECT n.*,r.loss_basis_points,r.transit_hours,r.origin_id FROM nominations n "
-            "JOIN routes r ON r.route_id=n.route_id WHERE n.nomination_id=?",
-            (nomination_id,),
-        ).fetchone()
-        if nomination is None:
-            raise NotFound("提名不存在")
-        if nomination["state"] != "allocated" or nomination["revision"] != expected_revision:
-            raise InvalidState("提名不是当前可交付版本")
-        lot = self.connection.execute("SELECT * FROM inventory_lots WHERE lot_id=?", (lot_id,)).fetchone()
-        if lot is None:
-            raise NotFound("储能电池资产批次不存在")
-        allocated = Decimal(nomination["allocated_energy_kwh"])
-        available = Decimal(lot["available_energy_kwh"])
-        if lot["facility_id"] != nomination["origin_id"] or lot["product"] != self.route(nomination["route_id"])["product"]:
-            raise Conflict("储能电池资产批次与调拨走廊起点或资源类型不匹配")
-        if available < allocated:
-            raise Conflict("可用能量库存不足以完成分配")
-        expected_delivery = delivered_after_loss(allocated, int(nomination["loss_basis_points"]))
-        departed_at = self._now()
-        with transaction(self.connection, immediate=True):
-            self.connection.execute(
-                "UPDATE inventory_lots SET available_energy_kwh=?,revision=revision+1 WHERE lot_id=? AND revision=?",
-                (decimal_text(quantize_volume(available - allocated)), lot_id, lot["revision"]),
-            )
-            self.connection.execute(
-                "UPDATE nominations SET state='in_transit',revision=revision+1 WHERE nomination_id=? AND revision=?",
-                (nomination_id, expected_revision),
-            )
-            self.connection.execute(
-                "INSERT INTO transfers(transfer_id,nomination_id,inventory_lot_id,loaded_energy_kwh,"
-                "expected_delivered_energy_kwh,departed_at,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (
-                    transfer_id,
-                    nomination_id,
-                    lot_id,
-                    decimal_text(allocated),
-                    decimal_text(expected_delivery),
-                    departed_at,
-                    actor_id,
-                    departed_at,
-                ),
-            )
-            self._audit("transfer", transfer_id, "transfer.dispatched", actor_id, {"nomination_id": nomination_id})
-        return {
+        request_digest = digest({
             "transfer_id": transfer_id,
-            "state": "in_transit",
-            "loaded_energy_kwh": decimal_text(allocated),
-            "expected_delivered_energy_kwh": decimal_text(expected_delivery),
-            "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=int(nomination["transit_hours"]))),
-        }
+            "nomination_id": nomination_id,
+            "lot_id": lot_id,
+            "expected_revision": expected_revision,
+        })
+        # 事务外的快速回放：重启或重试时直接按请求内容找回原裁决。
+        replay = self._replay_dispatch(transfer_id, request_digest)
+        if replay is not None:
+            return replay
+        response: dict[str, Any]
+        try:
+            with transaction(self.connection, immediate=True):
+                # 拿到写锁后在事务内重新核对，覆盖读检查之后落盘的并发胜出请求。
+                replay = self._replay_dispatch(transfer_id, request_digest)
+                if replay is not None:
+                    return replay
+                nomination = self.connection.execute(
+                    "SELECT n.*,r.product,r.loss_basis_points,r.transit_hours,r.origin_id "
+                    "FROM nominations n JOIN routes r ON r.route_id=n.route_id "
+                    "WHERE n.nomination_id=?",
+                    (nomination_id,),
+                ).fetchone()
+                if nomination is None:
+                    raise NotFound("提名不存在")
+                existing = self.connection.execute(
+                    "SELECT * FROM transfers WHERE nomination_id=?",
+                    (nomination_id,),
+                ).fetchone()
+                if existing is not None:
+                    # 同一申请只能有一条发车事实。
+                    if existing["transfer_id"] == transfer_id:
+                        return self._transfer_view(existing, int(nomination["transit_hours"]))
+                    raise Conflict("该运输申请已由其他发车编号确认，请以首次发车结果为准")
+                if nomination["state"] != "allocated" or nomination["revision"] != expected_revision:
+                    raise InvalidState("提名不是当前可交付版本")
+                lot = self.connection.execute(
+                    "SELECT * FROM inventory_lots WHERE lot_id=?",
+                    (lot_id,),
+                ).fetchone()
+                if lot is None:
+                    raise NotFound("储能电池资产批次不存在")
+                allocated = Decimal(nomination["allocated_energy_kwh"])
+                if lot["facility_id"] != nomination["origin_id"] or lot["product"] != nomination["product"]:
+                    raise Conflict("储能电池资产批次与调拨走廊起点或资源类型不匹配")
+                available = Decimal(lot["available_energy_kwh"])
+                if available < allocated:
+                    raise Conflict("可用能量库存不足以完成分配")
+                expected_delivery = delivered_after_loss(allocated, int(nomination["loss_basis_points"]))
+                departed_at = self._now()
+                inventory_cursor = self.connection.execute(
+                    "UPDATE inventory_lots SET available_energy_kwh=?,revision=revision+1 "
+                    "WHERE lot_id=? AND revision=?",
+                    (decimal_text(quantize_volume(available - allocated)), lot_id, lot["revision"]),
+                )
+                if inventory_cursor.rowcount != 1:
+                    raise Conflict("储能电池资产库存版本已变化，请刷新后重试")
+                nomination_cursor = self.connection.execute(
+                    "UPDATE nominations SET state='in_transit',revision=revision+1 "
+                    "WHERE nomination_id=? AND state='allocated' AND revision=?",
+                    (nomination_id, expected_revision),
+                )
+                if nomination_cursor.rowcount != 1:
+                    raise InvalidState("提名不是当前可交付版本")
+                self.connection.execute(
+                    "INSERT INTO transfers(transfer_id,nomination_id,inventory_lot_id,loaded_energy_kwh,"
+                    "expected_delivered_energy_kwh,departed_at,created_by,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        transfer_id,
+                        nomination_id,
+                        lot_id,
+                        decimal_text(allocated),
+                        decimal_text(expected_delivery),
+                        departed_at,
+                        actor_id,
+                        departed_at,
+                    ),
+                )
+                expected_arrival = utc_text(
+                    parse_utc(departed_at) + timedelta(hours=int(nomination["transit_hours"]))
+                )
+                response = {
+                    "transfer_id": transfer_id,
+                    "state": "in_transit",
+                    "loaded_energy_kwh": decimal_text(allocated),
+                    "expected_delivered_energy_kwh": decimal_text(expected_delivery),
+                    "expected_arrival": expected_arrival,
+                }
+                self.connection.execute(
+                    "INSERT INTO supply_idempotency(scope,idempotency_key,request_sha256,response_json,created_at) "
+                    "VALUES('transfer',?,?,?,?)",
+                    (transfer_id, request_digest, canonical_json(response), departed_at),
+                )
+                self._audit(
+                    "transfer",
+                    transfer_id,
+                    "transfer.dispatched",
+                    actor_id,
+                    {
+                        "nomination_id": nomination_id,
+                        "inventory_lot_id": lot_id,
+                        "loaded_energy_kwh": response["loaded_energy_kwh"],
+                        "expected_delivered_energy_kwh": response["expected_delivered_energy_kwh"],
+                        "expected_arrival": expected_arrival,
+                    },
+                )
+        except sqlite3.IntegrityError as exc:
+            # 任何残余存储约束冲突都转译为稳定业务冲突，不向外泄露存储异常。
+            raise Conflict("发车确认并发冲突，请刷新申请与库存版本后重试") from exc
+        return response
 
     def create_scenario(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "scenario.write")
